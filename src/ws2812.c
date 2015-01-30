@@ -186,12 +186,14 @@ void ws2812_dma_init(void)
 	TIM_CCMR1(TIM4) = (TIM_CCMR1_OC1M_PWM1 |
 					   TIM_CCMR1_OC1PE);
 
+	/* This is setting up the DMA and has to be ported to F4... */
 	//DMA_CCR(DMA1, DMA_CHANNEL7) = 0;
 	//DMA_CNDTR(DMA1, DMA_CHANNEL7) = WS2812_BUFFER_SIZE;
 	//DMA_CPAR(DMA1, DMA_CHANNEL7) = (uint32_t)(&TIM_CCR1(TIM4));
     //DMA_CMAR(DMA1, DMA_CHANNEL7) = (uint32_t)(&ws2812_dma_buffer[0]);
     //DMA_IFCR(DMA1) = DMA_IFCR_CGIF(DMA_CHANNEL7);
 
+    /* This is setting up the interrupt controller to call the DMA interrupts. */
     //nvic_clear_pending_irq(NVIC_DMA1_CHANNEL7_IRQ);
     //nvic_enable_irq(NVIC_DMA1_CHANNEL7_IRQ);
     //nvic_set_priority(NVIC_DMA1_CHANNEL7_IRQ, 0);
@@ -199,6 +201,7 @@ void ws2812_dma_init(void)
 
 void ws2812_dma_disable(void)
 {
+	/* Setting up DMA again find the F4 equivalent. */
 	//DMA_CCR(DMA1, DMA_CHANNEL7) = 0;
 	ws2812_set_outputs_low();
 }
@@ -213,6 +216,8 @@ void ws2812_mode_initialize(const void *data, uint16_t length)
     ws2812_fill_next_buffer(ws2812_timer_one_high(), ws2812_timer_zero_high());
     ws2812_fill_next_buffer(ws2812_timer_one_high(), ws2812_timer_zero_high());
     
+    /* TODO */
+    /* The actual configuration of the dma controller. Find similar setup for F4. */
     /* Enable the DMA request at the update event */
     /*DMA_CCR(DMA1, DMA_CHANNEL7) = (DMA_CCR_PL_HIGH |
     							   DMA_CCR_MSIZE_8BIT |
@@ -236,6 +241,7 @@ void ws2812_mode_initialize(const void *data, uint16_t length)
 
 void dma1_stream6_isr(void)
 {
+	/* TODO */
 	//DMA_IFCR(DMA1) = DMA_IFCR_CGIF(DMA_CHANNEL7);
         
     /* Not done yet, so fill the next buffer and wait for the send to
