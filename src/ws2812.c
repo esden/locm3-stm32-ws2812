@@ -36,8 +36,6 @@
 #define WS2812_T1H 0.64
 #define WS2812_TRESET 50e-6
 
-extern uint32_t rcc_ppre1_frequency;
-
 static volatile enum {
 	ws2812_state_uninit = 0,
 	ws2812_state_reset_blank,
@@ -89,7 +87,7 @@ void ws2812_timer_init(void)
 
 uint32_t ws2812_timer_input_frequency(void)
 {
-	return rcc_ppre1_frequency;
+	return rcc_apb1_frequency;
 }
 
 uint8_t ws2812_timer_period(void)
