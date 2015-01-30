@@ -17,9 +17,11 @@
 ## along with this library.  If not, see <http://www.gnu.org/licenses/>.
 ##
 
-BINARY = fancyblink
+BINARY = ws2812
 
-OBJS = main.o
+OBJS = main.o ws2812.o
+
+CFLAGS = -std=c99
 
 LDSCRIPT = ../stm32f4-discovery.ld
 
