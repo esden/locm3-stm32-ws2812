@@ -1,7 +1,9 @@
 /*
+ *
  * This file is part of the libopencm3 project.
  *
  * Copyright (C) 2015 Piotr Esden-Tempski <piotr@esden.net>
+ * Copyright (C) 2015 Jack Ziesing <jziesing@gmail.com>
  *
  * This library is free software: you can redistribute it and/or modify
  * it under the terms of the GNU Lesser General Public License as published by
@@ -10,296 +12,240 @@
  *
  * This library is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
  * GNU Lesser General Public License for more details.
  *
  * You should have received a copy of the GNU Lesser General Public License
- * along with this library.  If not, see <http://www.gnu.org/licenses/>.
+ * along with this library. If not, see <http://www.gnu.org/licenses/>.
  */
 
- /* This is the driver for controlling WS2812 RGB leds with built in pwm driver. */
-
-#include <stdint.h>
-#include <stdbool.h>
-
-#include <libopencm3/cm3/nvic.h>
-#include <libopencm3/stm32/timer.h>
 #include <libopencm3/stm32/rcc.h>
+#include <libopencm3/stm32/gpio.h>
+#include <libopencm3/stm32/timer.h>
 #include <libopencm3/stm32/dma.h>
-#include <libopencm3/cm3/cortex.h>
+#include <libopencm3/cm3/nvic.h>
 
 #include "ws2812.h"
 
-#define WS2812_BUFFER_SIZE 24*4
-#define WS2812_CLOCK 800000
-#define WS2812_T0H 0.32
-#define WS2812_T1H 0.64
-#define WS2812_TRESET 50e-6
+#define WS2812_BIT_BUFFER_SIZE (24*6)
 
-static volatile enum {
-	ws2812_state_uninit = 0,
-	ws2812_state_reset_blank,
-	ws2812_state_idle,
-	ws2812_state_sending
-} ws2812_state = ws2812_state_uninit;
+enum ws2812_stage {
+	ws2812_idle,
+	ws2812_sending,
+	ws2812_done,
+	ws2812_reset
+};
 
-uint8_t ws2812_dma_buffer[(WS2812_BUFFER_SIZE)];
-bool ws2812_buffer_half;
-const uint8_t *ws2812_send_begin;
-const uint8_t *ws2812_send_end;
+struct ws2812_status {
+	ws2812_led_t *leds;
+	int led_count;
+	int leds_sent;
+	volatile enum ws2812_stage stage;
+	uint16_t bit_buffer[WS2812_BIT_BUFFER_SIZE];
+} ws2812_status;
 
-void ws2812_timer_init(void);
-uint32_t ws2812_timer_input_frequency(void);
-uint8_t ws2812_timer_period(void);
-uint16_t ws2812_timer_reset_period(void);
-void ws2812_set_outputs_low(void);
-void ws2812_timer_start_reset(void);
-void ws2812_timer_start_main(void);
-uint8_t ws2812_timer_one_high(void);
-uint8_t ws2812_timer_zero_high(void);
-void ws2812_dma_disable(void);
-void ws2812_fill_next_buffer(uint8_t high, uint8_t low);
+/* Private function declarations. */
+void ws2812_gpio_init(void);
+void ws2812_tim_init(void);
 void ws2812_dma_init(void);
-void ws2812_mode_initialize(const void *data, uint16_t length);
-void ws2812_init(void);
-void ws2812_send(const void *data, uint16_t length);
-bool ws2812_busy(void);
-bool ws2812_transmitting(void);
+void ws2812_init_bit_buffer(void);
+void ws2812_fill_low_bit_buffer(void);
+void ws2812_fill_high_bit_buffer(void);
+void ws2812_fill_bit_buffer(bool low_high);
+void ws2812_clear_bit_buffer(void);
 
-void ws2812_timer_init(void)
+/* API functions. */
+void ws2812_init(void)
 {
-	/* Initialize peripheral clocks. */
-	rcc_periph_clock_enable(RCC_GPIOB);
+	ws2812_gpio_init();
+	ws2812_tim_init();
+	ws2812_dma_init();
+
+	ws2812_status.stage = ws2812_idle;
+}
+
+void ws2812_dma_start(void)
+{
+	dma_enable_stream(DMA1, DMA_STREAM6);
+}
+
+void ws2812_dma_stop(void)
+{
+	dma_disable_stream(DMA1, DMA_STREAM6);
+}
+
+void ws2812_send(ws2812_led_t *leds, int led_count)
+{
+	ws2812_status.leds = leds;
+	ws2812_status.led_count = led_count;
+	ws2812_status.leds_sent = 0;
+
+	ws2812_init_bit_buffer();
+	ws2812_dma_start();
+}
+
+bool ws2812_is_sending(void)
+{
+	return (ws2812_status.stage != ws2812_idle);
+}
+
+/* Private function implementations. */
+void ws2812_init_bit_buffer(void)
+{
+	ws2812_fill_low_bit_buffer();
+	ws2812_fill_high_bit_buffer();
+}
+
+void ws2812_fill_low_bit_buffer(void)
+{
+	ws2812_fill_bit_buffer(false);
+}
+
+void ws2812_fill_high_bit_buffer(void)
+{
+	ws2812_fill_bit_buffer(true);
+}
+
+void ws2812_fill_bit_buffer(bool low_high)
+{
+	int offset = 0;
+	int bitcount = WS2812_BIT_BUFFER_SIZE / 2;
+	int led = ws2812_status.leds_sent;
+	int i;
+
+	ws2812_status.stage = ws2812_sending;
+
+	if(low_high) {
+		offset = bitcount;
+	}
+
+	/*
+	 * 60 = 1
+	 * 29 = 0
+	 */
+	for(i = 0; i < bitcount; i++) {
+		if (i < ((ws2812_status.led_count - ws2812_status.leds_sent) * 24)) {
+			if (((ws2812_status.leds[ws2812_status.leds_sent + (i/24)].grbu >> (31 - (i % 24)))
+				 & 0x00000001) != 0) {
+				ws2812_status.bit_buffer[offset + i] = 60;
+			} else {
+				ws2812_status.bit_buffer[offset + i] = 29;
+			}
+			led = ws2812_status.leds_sent + ((i + 0) / 24);
+		} else {
+			ws2812_status.stage = ws2812_done;
+			break;
+		}
+	}
+
+	for(; i < bitcount; i++) {
+			ws2812_status.bit_buffer[offset + i] = 0;
+	}
+
+	ws2812_status.leds_sent = led + 1;
+}
+
+void ws2812_clear_bit_buffer(void) {
+	for(int i = 0; i < WS2812_BIT_BUFFER_SIZE; i++) {
+		ws2812_status.bit_buffer[i] = 0;
+	}
+}
+
+/* Hardware dependent code. */
+void ws2812_gpio_init(void)
+{
+	rcc_periph_clock_enable(RCC_GPIOD);
+    gpio_mode_setup(GPIOD, GPIO_MODE_AF, GPIO_PUPD_NONE, GPIO12);
+    gpio_mode_setup(GPIOD, GPIO_MODE_OUTPUT, GPIO_PUPD_NONE, GPIO13 | GPIO14);
+    gpio_set_af(GPIOD, GPIO_AF2, GPIO12);
+    /* Not sure why this does not really do the job if we have a pullup to 5V */
+    /* gpio_set_output_options(GPIOD, GPIO_OTYPE_OD, GPIO_OSPEED_2MHZ, GPIO12); */
+}
+
+void ws2812_tim_init(void)
+{
 	rcc_periph_clock_enable(RCC_TIM4);
+    timer_reset(TIM4);
+    timer_set_mode(TIM4, TIM_CR1_CKD_CK_INT, TIM_CR1_CMS_EDGE, TIM_CR1_DIR_UP);
+    timer_set_prescaler(TIM4, 0);
+    timer_continuous_mode(TIM4);
+    timer_set_period(TIM4, 104); /* 168000000 / 2 / 800000 (800khz pwm) */
+    timer_disable_oc_output(TIM4, TIM_OC1);
+    timer_disable_oc_clear(TIM4, TIM_OC1);
+    timer_enable_oc_preload(TIM4, TIM_OC1);
+    timer_set_oc_slow_mode(TIM4, TIM_OC1);
+    timer_set_oc_mode(TIM4, TIM_OC1, TIM_OCM_PWM1);
+    timer_set_oc_polarity_high(TIM4, TIM_OC1);
+    timer_set_oc_value(TIM4, TIM_OC1, 0);
+    timer_enable_oc_output(TIM4, TIM_OC1);
+    timer_enable_preload(TIM4);
 
- 	/* Initialize Timer. */
-	rcc_periph_reset_pulse(RCC_TIM4);
-	TIM_CR1(TIM4) = 0;
-	TIM_SR(TIM4) = 0;
+    timer_enable_irq(TIM4, TIM_DIER_UDE);
 
-	nvic_clear_pending_irq(NVIC_TIM4_IRQ);
-	nvic_enable_irq(NVIC_TIM4_IRQ);
-	nvic_set_priority(NVIC_TIM4_IRQ, 0);
-
-	TIM_CR1(TIM4) = 0;
-	TIM_PSC(TIM4) = 0;
-}
-
-uint32_t ws2812_timer_input_frequency(void)
-{
-	return rcc_apb1_frequency;
-}
-
-uint8_t ws2812_timer_period(void)
-{
-	return (uint16_t)((ws2812_timer_input_frequency() + (uint32_t)((WS2812_CLOCK)/2)) /
-		(uint32_t)(WS2812_CLOCK));
-}
-
-uint16_t ws2812_timer_reset_period(void)
-{
-	return (uint16_t)(ws2812_timer_input_frequency() /
-		(uint32_t)(1.0 / (WS2812_TRESET) + 0.5)) + 2;
-}
-
-void ws2812_set_outputs_low(void)
-{
-	TIM_CCR1(TIM4) = 0;
-}
-
-void ws2812_timer_start_reset(void)
-{
-	ws2812_state = ws2812_state_reset_blank;
-	TIM_CR1(TIM4) = 0;
-	TIM_ARR(TIM4) = (uint16_t)ws2812_timer_reset_period() - 1;
-    TIM_CNT(TIM4) = 0;
-   	ws2812_set_outputs_low();
-    TIM_EGR(TIM4) = TIM_EGR_UG;
-    TIM_SR(TIM4) = 0;
-    TIM_DIER(TIM4) = TIM_DIER_UIE;
-    TIM_CR1(TIM4) = TIM_CR1_CKD_CK_INT | TIM_CR1_CMS_EDGE | 
-        TIM_CR1_DIR_UP | TIM_CR1_ARPE | TIM_CR1_URS | TIM_CR1_CEN;
-}
-
-void ws2812_timer_start_main(void)
-{
-	TIM_CR1(TIM4) = 0;
-	TIM_ARR(TIM4) = (uint16_t)ws2812_timer_period() - 1;
-    TIM_CNT(TIM4) = 0;
-    TIM_SR(TIM4) = 0;
-    TIM_CR1(TIM4) = TIM_CR1_CKD_CK_INT | TIM_CR1_CMS_EDGE | 
-        TIM_CR1_DIR_UP | TIM_CR1_ARPE | TIM_CR1_URS | TIM_CR1_CEN;
-}
-
-uint8_t ws2812_timer_zero_high(void)
-{
-	uint32_t high = (uint32_t)((WS2812_T0H) * (WS2812_CLOCK) + 0.5);
-	return (uint8_t)((high * (uint32_t)ws2812_timer_period() + (uint32_t)((WS2812_CLOCK) / 2)) /
-		(uint32_t)(WS2812_CLOCK));
-}
-
-uint8_t ws2812_timer_one_high(void)
-{
-	uint32_t high = (uint32_t)((WS2812_T1H) * (WS2812_CLOCK) + 0.5);
-	return (uint8_t)((high * (uint32_t)ws2812_timer_period() + (uint32_t)((WS2812_CLOCK) / 2)) /
-		(uint32_t)(WS2812_CLOCK));
-}
-
-void tim4_isr(void)
-{
-	TIM_CR1(TIM4) = 0;
-	TIM_DIER(TIM4) = 0;
-	TIM_SR(TIM4) = 0;
-	ws2812_dma_disable();
-	ws2812_state = ws2812_state_idle;
-}
-
-void ws2812_fill_next_buffer(uint8_t high, uint8_t low)
-{
-	uint8_t *target;
-    if (ws2812_buffer_half) {
-        target = &ws2812_dma_buffer[(WS2812_BUFFER_SIZE)/2];
-    } else {
-        target = &ws2812_dma_buffer[0];
-    }
-    ws2812_buffer_half = !ws2812_buffer_half;
-    for (int total = 0; total < (WS2812_BUFFER_SIZE)/(8*2) &&
-            ws2812_send_begin != ws2812_send_end; ++ws2812_send_begin, ++total) {
-        uint8_t source = *ws2812_send_begin;
-        for (int bit=0; bit<8; bit++, source <<= 1, ++target) {
-            if (source & 0x80) {
-                *target = high;
-            } else {
-                *target = low;
-            }
-        }
-    }
+    timer_enable_counter(TIM4);
 }
 
 void ws2812_dma_init(void)
 {
 	rcc_periph_clock_enable(RCC_DMA1);
-
-	TIM_CCER(TIM4) = (TIM_CCER_CC1E);
-	TIM_CCMR1(TIM4) = (TIM_CCMR1_OC1M_PWM1 |
-					   TIM_CCMR1_OC1PE);
-
-	/* This is setting up the DMA and has to be ported to F4... */
-	//DMA_CCR(DMA1, DMA_CHANNEL7) = 0;
-	//DMA_CNDTR(DMA1, DMA_CHANNEL7) = WS2812_BUFFER_SIZE;
-	//DMA_CPAR(DMA1, DMA_CHANNEL7) = (uint32_t)(&TIM_CCR1(TIM4));
-    //DMA_CMAR(DMA1, DMA_CHANNEL7) = (uint32_t)(&ws2812_dma_buffer[0]);
-    //DMA_IFCR(DMA1) = DMA_IFCR_CGIF(DMA_CHANNEL7);
-
-    /* This is setting up the interrupt controller to call the DMA interrupts. */
-    //nvic_clear_pending_irq(NVIC_DMA1_CHANNEL7_IRQ);
-    //nvic_enable_irq(NVIC_DMA1_CHANNEL7_IRQ);
-    //nvic_set_priority(NVIC_DMA1_CHANNEL7_IRQ, 0);
+    nvic_enable_irq(NVIC_DMA1_STREAM6_IRQ);
+	dma_stream_reset(DMA1, DMA_STREAM6);
+    dma_set_priority(DMA1, DMA_STREAM6, DMA_SxCR_PL_VERY_HIGH);
+    dma_set_memory_size(DMA1, DMA_STREAM6, DMA_SxCR_MSIZE_16BIT);
+    dma_set_peripheral_size(DMA1, DMA_STREAM6, DMA_SxCR_PSIZE_16BIT);
+    dma_enable_circular_mode(DMA1, DMA_STREAM6);
+    dma_enable_memory_increment_mode(DMA1, DMA_STREAM6);
+    dma_set_transfer_mode(DMA1, DMA_STREAM6, DMA_SxCR_DIR_MEM_TO_PERIPHERAL);
+    dma_set_peripheral_address(DMA1, DMA_STREAM6, (uint32_t)&TIM4_CCR1);
+    dma_set_memory_address(DMA1, DMA_STREAM6, (uint32_t)(&ws2812_status.bit_buffer[0]));
+    dma_set_number_of_data(DMA1, DMA_STREAM6, WS2812_BIT_BUFFER_SIZE);
+    dma_enable_half_transfer_interrupt(DMA1, DMA_STREAM6);
+    dma_enable_transfer_complete_interrupt(DMA1, DMA_STREAM6);
+    dma_channel_select(DMA1, DMA_STREAM6, DMA_SxCR_CHSEL_2);
+    nvic_clear_pending_irq(NVIC_DMA1_STREAM6_IRQ);
+    nvic_set_priority(NVIC_DMA1_STREAM6_IRQ, 0);
+    nvic_enable_irq(NVIC_DMA1_STREAM6_IRQ);
 }
 
-void ws2812_dma_disable(void)
-{
-	/* Setting up DMA again find the F4 equivalent. */
-	//DMA_CCR(DMA1, DMA_CHANNEL7) = 0;
-	ws2812_set_outputs_low();
-}
-
-void ws2812_mode_initialize(const void *data, uint16_t length)
-{
-	/* Initialize both buffers and start a send (the request won't
-     * actually come in until the timer is started). */
-    ws2812_send_begin = (const uint8_t *)data;
-    ws2812_send_end = ws2812_send_begin + length;        
-    ws2812_buffer_half = false;
-    ws2812_fill_next_buffer(ws2812_timer_one_high(), ws2812_timer_zero_high());
-    ws2812_fill_next_buffer(ws2812_timer_one_high(), ws2812_timer_zero_high());
-    
-    /* TODO */
-    /* The actual configuration of the dma controller. Find similar setup for F4. */
-    /* Enable the DMA request at the update event */
-    /*DMA_CCR(DMA1, DMA_CHANNEL7) = (DMA_CCR_PL_HIGH |
-    							   DMA_CCR_MSIZE_8BIT |
-            					   DMA_CCR_PSIZE_16BIT |
-            					   DMA_CCR_MINC |
-            					   DMA_CCR_CIRC |
-            					   DMA_CCR_DIR |
-            					   DMA_CCR_TCIE |
-            					   DMA_CCR_HTIE |
-            					   DMA_CCR_EN);*/
-    TIM_DIER(TIM4) = TIM_DIER_UDE;
-    
-    /* This means that output won't be updated until the second
-     * clock cycle (since the DMA request won't come in until the
-     * update at the end of the first, and the register itself won't
-     * take the shadow value until the one after that).  This is fine,
-     * however, as we just hold it low and this gives us plenty of
-     * time to finish up handling. */
-    TIM_CCR1(TIM4) = 0;
-}
-
+/* Interrupt handlers. */
 void dma1_stream6_isr(void)
 {
-	/* TODO */
-	//DMA_IFCR(DMA1) = DMA_IFCR_CGIF(DMA_CHANNEL7);
-        
-    /* Not done yet, so fill the next buffer and wait for the send to
-     * complete. */
-    if (ws2812_send_begin != ws2812_send_end) {
-            ws2812_fill_next_buffer(ws2812_timer_one_high(), ws2812_timer_zero_high());
-        return;
+    if (dma_get_interrupt_flag(DMA1, DMA_STREAM6, DMA_HTIF) != 0) {
+        dma_clear_interrupt_flags(DMA1, DMA_STREAM6, DMA_HTIF);
+
+        gpio_toggle(GPIOD, GPIO13);
+
+        if(ws2812_status.stage != ws2812_idle){
+        	if(ws2812_status.stage == ws2812_done) {
+        		ws2812_fill_low_bit_buffer();
+        		ws2812_status.stage = ws2812_idle;
+        	} else {
+        		ws2812_fill_low_bit_buffer();
+        	}
+        } else {
+        	ws2812_clear_bit_buffer();
+        	ws2812_dma_stop();
+        	timer_set_oc_value(TIM4, TIM_OC1, 0);
+        }
+
     }
+    if (dma_get_interrupt_flag(DMA1, DMA_STREAM6, DMA_TCIF) != 0) {
+        dma_clear_interrupt_flags(DMA1, DMA_STREAM6, DMA_TCIF);
 
-    /* Just clock out one extra buffer to make sure everything is
-     * completely out before we start the reset sequence. */
-    if (ws2812_send_begin != 0) {
-        ws2812_send_begin = 0;
-        ws2812_send_end = 0;
-        return;
+        gpio_toggle(GPIOD, GPIO14);
+
+        if(ws2812_status.stage != ws2812_idle){
+            if(ws2812_status.stage == ws2812_done) {
+        		ws2812_fill_high_bit_buffer();
+        	    ws2812_status.stage = ws2812_idle;
+            } else {
+        	    ws2812_fill_high_bit_buffer();
+            }
+        } else {
+        	ws2812_clear_bit_buffer();
+        	ws2812_dma_stop();
+        	timer_set_oc_value(TIM4, TIM_OC1, 0);
+        }
+
     }
-    
-    /* May already have clocked something out, but we don't care at this
-     * point since it's past the end of the chain. */
-    ws2812_dma_disable();
-    ws2812_timer_start_reset();
-}
-
-void ws2812_init(void)
-{
-	/* disable interrupts */
-	cm_disable_interrupts();
-
-	ws2812_timer_init();
-	ws2812_dma_init();
-	ws2812_timer_start_reset();
-
-	/* reenable interrupts */
-	cm_enable_interrupts();
-}
-
-void ws2812_send(const void *data, uint16_t length)
-{
-	if (ws2812_state == ws2812_state_uninit){
-		ws2812_init();
-	}
-	while (ws2812_busy()) { __asm__("nop"); }
-	if (length == 0)
-		return;
-
-	cm_enable_interrupts();
-	ws2812_state = ws2812_state_sending;
-	ws2812_timer_init();
-	ws2812_dma_init();
-	ws2812_mode_initialize(data, length);
-	ws2812_timer_start_main();
-	cm_disable_interrupts();
-}
-
-bool ws2812_busy(void)
-{
-	return ws2812_state != ws2812_state_idle;
-}
-
-bool ws2812_transmitting(void)
-{
-	return ws2812_state == ws2812_state_sending;
 }
