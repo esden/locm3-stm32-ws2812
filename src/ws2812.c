@@ -61,8 +61,6 @@ void ws2812_dma_disable(void);
 void ws2812_fill_next_buffer(uint8_t high, uint8_t low);
 void ws2812_dma_init(void);
 void ws2812_mode_initialize(const void *data, uint16_t length);
-void ws2812_init(void);
-void ws2812_send(const void *data, uint16_t length);
 bool ws2812_busy(void);
 bool ws2812_transmitting(void);
 
@@ -278,12 +276,10 @@ void ws2812_init(void)
 
 void ws2812_send(const void *data, uint16_t length)
 {
-	if (ws2812_state == ws2812_state_uninit){
-		ws2812_init();
-	}
-	while (ws2812_busy()) { __asm__("nop"); }
 	if (length == 0)
 		return;
+
+	while (ws2812_busy()) { __asm__("nop"); }
 
 	cm_enable_interrupts();
 	ws2812_state = ws2812_state_sending;

@@ -22,6 +22,8 @@
 #include <libopencm3/stm32/rcc.h>
 #include <libopencm3/stm32/gpio.h>
 
+#include "ws2812.h"
+
 /* Set STM32 to 168 MHz. */
 static void clock_setup(void)
 {
@@ -40,22 +42,13 @@ static void gpio_setup(void)
 
 int main(void)
 {
-	int i;
-
 	clock_setup();
 	gpio_setup();
 
-	/* Set two LEDs for wigwag effect when toggling. */
-	gpio_set(GPIOD, GPIO12 | GPIO14);
+	ws2812_init();
 
-	/* Blink the LEDs (PD12, PD13, PD14 and PD15) on the board. */
-	while (1) {
-		/* Toggle LEDs. */
-		gpio_toggle(GPIOD, GPIO12 | GPIO13 | GPIO14 | GPIO15);
-		for (i = 0; i < 6000000; i++) { /* Wait a bit. */
-			__asm__("nop");
-		}
-	}
+	/* we should probably send some colors to the leds here. */
+	/* ws2812_send(bla, length);*/
 
 	return 0;
 }
